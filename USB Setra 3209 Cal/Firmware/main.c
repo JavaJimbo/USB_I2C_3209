@@ -1,4 +1,4 @@
-/**********************************************************************************************
+/********************************************************************************************************************
  * FileName: main.c Adapted from Microchip CDC serial emulator
  * Compiled for PIC32MX795 XC32 compiler version 1.30
  * 
@@ -9,11 +9,17 @@
  * 8-1-18: 
  * 8-8-18: Put back CRC check, added "BOOT UP" to $HELLO command, removed sprintf() from $TEST
  *          Added I2C timeouts to prevent PIC from getting stuck waiting for ACKs or data.
- ***********************************************************************************************/
+ * 8-20-18: Couldn't find any issues.
+ * 8-24-18: Clamp I2C to ground when not communicating. Implement power supply sequencing, add CloseI2C() command.
+ *********************************************************************************************************************/
 #include "./USB/usb.h"
 #include "./USB/usb_function_cdc.h"
 #include "HardwareProfile.h"
 #include "./uart2.h"
+
+#define POWERUP_DELAY 50
+
+
 
 // #define USE_USB
 
@@ -145,6 +151,7 @@ unsigned char   sendToUSB(unsigned char *ptrUSBpacket);
 extern BOOL     CRCcheck(char *ptrPacket);
 extern UINT16   CRCcalculate(char *ptrPacket, BOOL addCRCtoPacket);
 unsigned char   OpenPcapI2C();
+unsigned char   ClosePcapI2C();
 unsigned char   PCAPPowerOnReset();
 unsigned char   InitializePCAP();
 unsigned char   PcapReadNVRAM(unsigned short startAddress, unsigned short numBytes);
@@ -187,12 +194,30 @@ void putcUSART(char c);
 unsigned char getcUSART ();
 static unsigned char dataReady = false; 
 
+unsigned char OpenPcapI2C()
+{
+    DelayMs(POWERUP_DELAY);
+    OpenI2C(I2C_EN, 299);    
+    return true;
+}
+
+unsigned char ClosePcapI2C()
+{
+    CloseI2C();
+    mPORTASetPinsDigitalOut(BIT_2 | BIT_3);
+    mPORTAClearBits(BIT_2 | BIT_3);    
+    DelayMs(POWERUP_DELAY);
+    return true;
+}
+
 
 void main(void)
 {        
 int i;
 int LEDcounter;
     
+    LATAbits.LATA2 = 0;
+    LATAbits.LATA3 = 0;
     LATBbits.LATB13 = 0;
     LATBbits.LATB14 = 0;
     LATBbits.LATB15 = 0; 
@@ -202,6 +227,12 @@ int LEDcounter;
     RELAY_K1_OFF();    
 
     InitializeSystem();   
+    
+    ClosePcapI2C();
+    // ShutDownI2C();
+    
+    // printf("\rStarting Setra 3209 Cal program");
+    
     LEDcounter = 1000;   
     
     mLED_1_Off();
@@ -212,7 +243,7 @@ int LEDcounter;
     // Make sure CHARGE PUMP bytes are initialized to 0x00:
     for (i = 0; i < NVRAM_SIZE; i++)  NVRAMdata[i] = CopyNVRAMdata[i] = 0x00;
         
-    OpenPcapI2C();    
+    // OpenPcapI2C();
 
 #ifdef USE_USB    
     // printf("\rStarting USB version");
@@ -238,7 +269,7 @@ int LEDcounter;
         ProcessIO();        
     }
 #else
-    // printf("\rStarting UART version @ 115200 baud");
+    printf("\rTesting power supply sequencing");
     while(1) 
     {
         ClrWdt(); // Reset watchdog timer
@@ -246,10 +277,12 @@ int LEDcounter;
         if (HOSTRxBufferFull) 
         {
             HOSTRxBufferFull = false;               
-            if (!CRCcheck(HOSTRxBuffer)) 
-               replyToHost("!CRC ERROR");                        
-            else if (!processInputString(HOSTRxBuffer))
-                replyToHost("!COMMAND STRING ERROR");
+            //if (!CRCcheck(HOSTRxBuffer)) 
+            //   replyToHost("!CRC ERROR");                        
+            //else if (!processInputString(HOSTRxBuffer))
+            //    replyToHost("!COMMAND STRING ERROR");
+            if (!processInputString(HOSTRxBuffer))
+                replyToHost("!COMMAND STRING ERROR");  // $$$$
         }
         DelayMs(1);
         if (LEDcounter) 
@@ -488,6 +521,9 @@ void InitializeSystem(void)
     INTEnable(INT_SOURCE_UART_RX(HOSTuart), INT_ENABLED);
     INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
     INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);
+    
+    mPORTASetPinsDigitalOut(BIT_2 | BIT_3);
+    mPORTAClearBits(BIT_2 | BIT_3);
 
     PORTClearBits(IOPORT_B, BIT_3 | BIT_12 | BIT_13 | BIT_14 | BIT_15);
     mPORTBSetPinsDigitalOut(BIT_3 | BIT_12 | BIT_13 | BIT_14 | BIT_15);
@@ -507,13 +543,6 @@ void InitializeSystem(void)
     
 	mInitAllLEDs();    
 }//end UserInit
-
-
-unsigned char OpenPcapI2C()
-{
-    OpenI2C(I2C_EN, 299);    
-    return true;
-}   
 
 unsigned char PCAPPowerOnReset()
 {
@@ -611,6 +640,14 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
         }
         else strcpy(strReply, "$OK HELLO_WORLD");
     }
+    else if (!strcmp(ptrCommand, "OPEN"))
+    {
+        OpenPcapI2C();
+    }    
+    else if (!strcmp(ptrCommand, "CLOSE"))
+    {
+        ClosePcapI2C();
+    }      
     else if (!strcmp(ptrCommand, "REBOOT"))
     {
         while(1);
@@ -767,9 +804,10 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
         convert.byte[1] = (unsigned char) ptrData[2];
         numDataBytes = convert.integer;   
         
-        if (PcapReadNVRAM(NVRAMstartAddress, numDataBytes))
-        {
-            // printf("DONE");
+        if ((NVRAMstartAddress + numDataBytes) > NVRAM_SIZE)
+            strcpy(strReply, "$ADDRESS_OUT_OF_RANGE");
+        else if (PcapReadNVRAM(NVRAMstartAddress, numDataBytes))
+        {            
             strcpy(strReply, "$OK ");
             for (i = NVRAMstartAddress; i < (NVRAMstartAddress + numDataBytes); i++)
             {
@@ -791,8 +829,8 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
     }        
     else if (!strcmp(ptrCommand, "READ_RESULT"))
     {        
-        numDataBytes = (unsigned char) ptrData[1];
         registerAddress = (unsigned char) ptrData[0];
+        numDataBytes = (unsigned char) ptrData[1];        
         
         for (i = 0; i < MAX_RESULT_REGISTERS; i++) arrRegister[i] = 0;            
         
@@ -820,7 +858,7 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
         convert.byte[1] = (unsigned char) ptrData[2];
         numDataBytes = convert.integer;   
         
-        if ((NVRAMstartAddress + numDataBytes) >= NVRAM_SIZE)
+        if ((NVRAMstartAddress + numDataBytes) > NVRAM_SIZE)
         {
             strcpy(strReply, "$ERROR: ADRESS OUT OF BOUNDS");   
             return false;
@@ -835,21 +873,10 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
             if (i != CHARGE_PUMP_LOW && i != CHARGE_PUMP_HIGH) 
                 NVRAMdata[i] = (unsigned char) ptrData[i+4];
         }        
-    }
-    else if (!strcmp(ptrCommand, "RELAY_K1_ON"))
-        RELAY_K1_ON();
-    else if (!strcmp(ptrCommand, "RELAY_K2_ON"))
-        RELAY_K2_ON();
-    else if (!strcmp(ptrCommand, "RELAY_K3_ON"))
-        RELAY_K3_ON();
-    else if (!strcmp(ptrCommand, "RELAY_K1_OFF"))
-        RELAY_K1_OFF();
-    else if (!strcmp(ptrCommand, "RELAY_K2_OFF"))
-        RELAY_K2_OFF();
-    else if (!strcmp(ptrCommand, "RELAY_K3_OFF"))
-        RELAY_K3_OFF();    
+    }   
     else if (!strcmp(ptrCommand, "RESET_RELAYS"))
     {
+        ClosePcapI2C();        
         RELAY_K1_OFF();
         RELAY_K2_OFF();
         RELAY_K3_OFF();
@@ -859,24 +886,28 @@ unsigned char executeCommand(unsigned char *ptrCommand, short *ptrData)
         RELAY_K1_OFF();
         RELAY_K2_ON();
         RELAY_K3_OFF();
+        OpenPcapI2C();
     }
     else if (!strcmp(ptrCommand, "SET_24V_VOUT"))
     {
         RELAY_K1_ON();
         RELAY_K2_ON();
         RELAY_K3_OFF();
+        OpenPcapI2C();
     }
     else if (!strcmp(ptrCommand, "SET_MA_OUT"))
     {
         RELAY_K1_ON();
         RELAY_K2_ON();
         RELAY_K3_OFF();
+        OpenPcapI2C();
     }
     else if (!strcmp(ptrCommand, "SET_THERMISTOR"))
     {
+        ClosePcapI2C();
         RELAY_K1_OFF();
         RELAY_K2_OFF();
-        RELAY_K3_ON();
+        RELAY_K3_ON();        
     }    
     else strcpy(strReply, "$ERROR UNRECOGNIZED COMMAND");
     // strcat(strReply, "<");
@@ -1447,6 +1478,8 @@ unsigned char sendToUART(unsigned char UartID, unsigned char *ptrUARTpacket)
     }
     else return (false);
 }
+
+
 
 
 /** EOF main.c *************************************************/
